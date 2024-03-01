@@ -18,62 +18,14 @@ use std::{
     ptr::null_mut,
 };
 
+use nix::unistd::{Uid, User};
+
 use crate::{
     os::{Os, Target},
     Arch, DesktopEnv, Language, Platform, Result,
 };
 
-#[cfg(not(any(
-    target_os = "macos",
-    target_os = "freebsd",
-    target_os = "dragonfly",
-    target_os = "bitrig",
-    target_os = "openbsd",
-    target_os = "netbsd"
-)))]
-#[repr(C)]
-struct PassWd {
-    pw_name: *const c_void,
-    pw_passwd: *const c_void,
-    pw_uid: u32,
-    pw_gid: u32,
-    pw_gecos: *const c_void,
-    pw_dir: *const c_void,
-    pw_shell: *const c_void,
-}
-
-#[cfg(any(
-    target_os = "macos",
-    target_os = "freebsd",
-    target_os = "dragonfly",
-    target_os = "bitrig",
-    target_os = "openbsd",
-    target_os = "netbsd"
-))]
-#[repr(C)]
-struct PassWd {
-    pw_name: *const c_void,
-    pw_passwd: *const c_void,
-    pw_uid: u32,
-    pw_gid: u32,
-    pw_change: isize,
-    pw_class: *const c_void,
-    pw_gecos: *const c_void,
-    pw_dir: *const c_void,
-    pw_shell: *const c_void,
-    pw_expire: isize,
-    pw_fields: i32,
-}
-
 extern "system" {
-    fn getpwuid_r(
-        uid: u32,
-        pwd: *mut PassWd,
-        buf: *mut c_void,
-        buflen: usize,
-        result: *mut *mut PassWd,
-    ) -> i32;
-    fn geteuid() -> u32;
     fn gethostname(name: *mut c_void, len: usize) -> i32;
 }
 
@@ -114,56 +66,6 @@ unsafe fn strlen(cs: *const c_void) -> usize {
     len
 }
 
-unsafe fn strlen_gecos(cs: *const c_void) -> usize {
-    let mut len = 0;
-    let mut cs: *const u8 = cs.cast();
-    while *cs != 0 && *cs != b',' {
-        len += 1;
-        cs = cs.offset(1);
-    }
-    len
-}
-
-fn os_from_cstring_gecos(string: *const c_void) -> Result<OsString> {
-    if string.is_null() {
-        return Err(Error::new(ErrorKind::NotFound, "Null record"));
-    }
-
-    // Get a byte slice of the c string.
-    let slice = unsafe {
-        let length = strlen_gecos(string);
-
-        if length == 0 {
-            return Err(Error::new(ErrorKind::InvalidData, "Empty record"));
-        }
-
-        std::slice::from_raw_parts(string.cast(), length)
-    };
-
-    // Turn byte slice into Rust String.
-    Ok(OsString::from_vec(slice.to_vec()))
-}
-
-fn os_from_cstring(string: *const c_void) -> Result<OsString> {
-    if string.is_null() {
-        return Err(Error::new(ErrorKind::NotFound, "Null record"));
-    }
-
-    // Get a byte slice of the c string.
-    let slice = unsafe {
-        let length = strlen(string);
-
-        if length == 0 {
-            return Err(Error::new(ErrorKind::InvalidData, "Empty record"));
-        }
-
-        std::slice::from_raw_parts(string.cast(), length)
-    };
-
-    // Turn byte slice into Rust String.
-    Ok(OsString::from_vec(slice.to_vec()))
-}
-
 #[cfg(target_os = "macos")]
 fn os_from_cfstring(string: *mut c_void) -> OsString {
     if string.is_null() {
@@ -193,43 +95,22 @@ fn os_from_cfstring(string: *mut c_void) -> OsString {
     }
 }
 
-// This function must allocate, because a slice or `Cow<OsStr>` would still
-// reference `passwd` which is dropped when this function returns.
 #[inline(always)]
 fn getpwuid(name: Name) -> Result<OsString> {
-    const BUF_SIZE: usize = 16_384; // size from the man page
-    let mut buffer = mem::MaybeUninit::<[u8; BUF_SIZE]>::uninit();
-    let mut passwd = mem::MaybeUninit::<PassWd>::uninit();
-    let mut _passwd = mem::MaybeUninit::<*mut PassWd>::uninit();
+    let user = User::from_uid(Uid::effective())?
+        .ok_or_else(|| Error::new(ErrorKind::NotFound, "Null record"))?;
 
-    // Get PassWd `struct`.
-    let passwd = unsafe {
-        let ret = getpwuid_r(
-            geteuid(),
-            passwd.as_mut_ptr(),
-            buffer.as_mut_ptr() as *mut c_void,
-            BUF_SIZE,
-            _passwd.as_mut_ptr(),
-        );
-
-        if ret != 0 {
-            return Err(Error::last_os_error());
+    match name {
+        Name::User => Ok(OsString::from(user.name)),
+        Name::Real => {
+            // * The full user name is stored in the gecos field, which is
+            //   exposed by nix as a `CString` (C-style null-terminated string).
+            // * `CString::into_bytes` converts the string into a `Vec<u8>`
+            //   without the trailing null.
+            // * `OsString::from_vec`, only available on Unix, converts the
+            //   `Vec<u8>` into an `OsString`.
+            Ok(OsString::from_vec(user.gecos.into_bytes()))
         }
-
-        let _passwd = _passwd.assume_init();
-
-        if _passwd.is_null() {
-            return Err(Error::new(ErrorKind::NotFound, "Null record"));
-        }
-
-        passwd.assume_init()
-    };
-
-    // Extract names.
-    if let Name::Real = name {
-        os_from_cstring_gecos(passwd.pw_gecos)
-    } else {
-        os_from_cstring(passwd.pw_name)
     }
 }
 
