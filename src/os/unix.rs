@@ -1,81 +1,29 @@
 use std::{
     env,
-    ffi::{c_void, CStr, OsString},
+    ffi::OsString,
     fs,
     io::{Error, ErrorKind},
     mem,
-    os::{
-        raw::{c_char, c_int},
-        unix::ffi::OsStringExt,
-    },
+    os::unix::ffi::OsStringExt,
 };
 #[cfg(target_os = "macos")]
 use std::{
     os::{
-        raw::{c_long, c_uchar},
+        raw::{c_long, c_uchar, c_void},
         unix::ffi::OsStrExt,
     },
     ptr::null_mut,
+};
+
+use nix::{
+    sys::utsname::uname,
+    unistd::{gethostname, Uid, User},
 };
 
 use crate::{
     os::{Os, Target},
     Arch, DesktopEnv, Language, Platform, Result,
 };
-
-#[cfg(not(any(
-    target_os = "macos",
-    target_os = "freebsd",
-    target_os = "dragonfly",
-    target_os = "bitrig",
-    target_os = "openbsd",
-    target_os = "netbsd"
-)))]
-#[repr(C)]
-struct PassWd {
-    pw_name: *const c_void,
-    pw_passwd: *const c_void,
-    pw_uid: u32,
-    pw_gid: u32,
-    pw_gecos: *const c_void,
-    pw_dir: *const c_void,
-    pw_shell: *const c_void,
-}
-
-#[cfg(any(
-    target_os = "macos",
-    target_os = "freebsd",
-    target_os = "dragonfly",
-    target_os = "bitrig",
-    target_os = "openbsd",
-    target_os = "netbsd"
-))]
-#[repr(C)]
-struct PassWd {
-    pw_name: *const c_void,
-    pw_passwd: *const c_void,
-    pw_uid: u32,
-    pw_gid: u32,
-    pw_change: isize,
-    pw_class: *const c_void,
-    pw_gecos: *const c_void,
-    pw_dir: *const c_void,
-    pw_shell: *const c_void,
-    pw_expire: isize,
-    pw_fields: i32,
-}
-
-extern "system" {
-    fn getpwuid_r(
-        uid: u32,
-        pwd: *mut PassWd,
-        buf: *mut c_void,
-        buflen: usize,
-        result: *mut *mut PassWd,
-    ) -> i32;
-    fn geteuid() -> u32;
-    fn gethostname(name: *mut c_void, len: usize) -> i32;
-}
 
 #[cfg(target_os = "macos")]
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -104,6 +52,7 @@ enum Name {
     Real,
 }
 
+#[cfg(target_os = "macos")]
 unsafe fn strlen(cs: *const c_void) -> usize {
     let mut len = 0;
     let mut cs: *const u8 = cs.cast();
@@ -112,56 +61,6 @@ unsafe fn strlen(cs: *const c_void) -> usize {
         cs = cs.offset(1);
     }
     len
-}
-
-unsafe fn strlen_gecos(cs: *const c_void) -> usize {
-    let mut len = 0;
-    let mut cs: *const u8 = cs.cast();
-    while *cs != 0 && *cs != b',' {
-        len += 1;
-        cs = cs.offset(1);
-    }
-    len
-}
-
-fn os_from_cstring_gecos(string: *const c_void) -> Result<OsString> {
-    if string.is_null() {
-        return Err(Error::new(ErrorKind::NotFound, "Null record"));
-    }
-
-    // Get a byte slice of the c string.
-    let slice = unsafe {
-        let length = strlen_gecos(string);
-
-        if length == 0 {
-            return Err(Error::new(ErrorKind::InvalidData, "Empty record"));
-        }
-
-        std::slice::from_raw_parts(string.cast(), length)
-    };
-
-    // Turn byte slice into Rust String.
-    Ok(OsString::from_vec(slice.to_vec()))
-}
-
-fn os_from_cstring(string: *const c_void) -> Result<OsString> {
-    if string.is_null() {
-        return Err(Error::new(ErrorKind::NotFound, "Null record"));
-    }
-
-    // Get a byte slice of the c string.
-    let slice = unsafe {
-        let length = strlen(string);
-
-        if length == 0 {
-            return Err(Error::new(ErrorKind::InvalidData, "Empty record"));
-        }
-
-        std::slice::from_raw_parts(string.cast(), length)
-    };
-
-    // Turn byte slice into Rust String.
-    Ok(OsString::from_vec(slice.to_vec()))
 }
 
 #[cfg(target_os = "macos")]
@@ -193,43 +92,22 @@ fn os_from_cfstring(string: *mut c_void) -> OsString {
     }
 }
 
-// This function must allocate, because a slice or `Cow<OsStr>` would still
-// reference `passwd` which is dropped when this function returns.
 #[inline(always)]
 fn getpwuid(name: Name) -> Result<OsString> {
-    const BUF_SIZE: usize = 16_384; // size from the man page
-    let mut buffer = mem::MaybeUninit::<[u8; BUF_SIZE]>::uninit();
-    let mut passwd = mem::MaybeUninit::<PassWd>::uninit();
-    let mut _passwd = mem::MaybeUninit::<*mut PassWd>::uninit();
+    let user = User::from_uid(Uid::effective())?
+        .ok_or_else(|| Error::new(ErrorKind::NotFound, "Null record"))?;
 
-    // Get PassWd `struct`.
-    let passwd = unsafe {
-        let ret = getpwuid_r(
-            geteuid(),
-            passwd.as_mut_ptr(),
-            buffer.as_mut_ptr() as *mut c_void,
-            BUF_SIZE,
-            _passwd.as_mut_ptr(),
-        );
-
-        if ret != 0 {
-            return Err(Error::last_os_error());
+    match name {
+        Name::User => Ok(OsString::from(user.name)),
+        Name::Real => {
+            // * The full user name is stored in the gecos field, which is
+            //   exposed by nix as a `CString` (C-style null-terminated string).
+            // * `CString::into_bytes` converts the string into a `Vec<u8>`
+            //   without the trailing null.
+            // * `OsString::from_vec`, only available on Unix, converts the
+            //   `Vec<u8>` into an `OsString`.
+            Ok(OsString::from_vec(user.gecos.into_bytes()))
         }
-
-        let _passwd = _passwd.assume_init();
-
-        if _passwd.is_null() {
-            return Err(Error::new(ErrorKind::NotFound, "Null record"));
-        }
-
-        passwd.assume_init()
-    };
-
-    // Extract names.
-    if let Name::Real = name {
-        os_from_cstring_gecos(passwd.pw_gecos)
-    } else {
-        os_from_cstring(passwd.pw_name)
     }
 }
 
@@ -338,69 +216,22 @@ pub(crate) fn lang() -> impl Iterator<Item = String> {
     }
 }
 
-#[cfg(any(
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd",
-    target_os = "illumos"
-))]
-#[repr(C)]
-struct UtsName {
-    sysname: [c_char; 256],
-    nodename: [c_char; 256],
-    release: [c_char; 256],
-    version: [c_char; 256],
-    machine: [c_char; 256],
-}
+#[cfg(not(target_os = "macos"))]
+fn read_devicename_from_machine_info() -> Result<OsString> {
+    let machine_info = fs::read("/etc/machine-info")?;
 
-#[cfg(target_os = "dragonfly")]
-#[repr(C)]
-struct UtsName {
-    sysname: [c_char; 32],
-    nodename: [c_char; 32],
-    release: [c_char; 32],
-    version: [c_char; 32],
-    machine: [c_char; 32],
-}
+    for i in machine_info.split(|b| *b == b'\n') {
+        let mut j = i.split(|b| *b == b'=');
 
-#[cfg(any(target_os = "linux", target_os = "android",))]
-#[repr(C)]
-struct UtsName {
-    sysname: [c_char; 65],
-    nodename: [c_char; 65],
-    release: [c_char; 65],
-    version: [c_char; 65],
-    machine: [c_char; 65],
-    domainname: [c_char; 65],
-}
-
-// Buffer initialization
-impl Default for UtsName {
-    fn default() -> Self {
-        unsafe { mem::zeroed() }
-    }
-}
-
-#[inline(always)]
-unsafe fn uname(buf: *mut UtsName) -> c_int {
-    extern "C" {
-        #[cfg(not(target_os = "freebsd"))]
-        fn uname(buf: *mut UtsName) -> c_int;
-
-        #[cfg(target_os = "freebsd")]
-        fn __xuname(nmln: c_int, buf: *mut c_void) -> c_int;
+        if j.next() == Some(b"PRETTY_HOSTNAME") {
+            if let Some(value) = j.next() {
+                // FIXME: Can " be escaped in pretty name?
+                return Ok(OsString::from_vec(value.to_vec()));
+            }
+        }
     }
 
-    // Polyfill `uname()` for FreeBSD
-    #[inline(always)]
-    #[cfg(target_os = "freebsd")]
-    unsafe extern "C" fn uname(buf: *mut UtsName) -> c_int {
-        __xuname(256, buf.cast())
-    }
-
-    uname(buf)
+    Err(Error::new(ErrorKind::NotFound, "Missing record"))
 }
 
 impl Target for Os {
@@ -419,6 +250,8 @@ impl Target for Os {
     fn devicename(self) -> Result<OsString> {
         #[cfg(target_os = "macos")]
         {
+            // On macOS, the computer name is fetched from the System
+            // Configuration framework.
             let out = os_from_cfstring(unsafe {
                 SCDynamicStoreCopyComputerName(null_mut(), null_mut())
             });
@@ -430,54 +263,35 @@ impl Target for Os {
             Ok(out)
         }
 
-        #[cfg(target_os = "illumos")]
+        #[cfg(not(target_os = "macos"))]
         {
-            let mut nodename = fs::read("/etc/nodename")?;
+            // On other platforms, attempt to read /etc/machine-info, and fall
+            // back to the nodename.
+            let mi_error = match read_devicename_from_machine_info() {
+                Ok(devicename) => return Ok(devicename),
+                Err(mi_error) => mi_error,
+            };
 
-            // Remove all at and after the first newline (before end of file)
-            if let Some(slice) = nodename.split(|x| *x == b'\n').next() {
-                nodename.drain(slice.len()..);
-            }
+            let uname_error = match uname() {
+                Ok(uts_name) => return Ok(uts_name.nodename().to_os_string()),
+                Err(uname_error) => uname_error,
+            };
 
-            if nodename.is_empty() {
-                return Err(Error::new(ErrorKind::InvalidData, "Empty record"));
-            }
-
-            Ok(OsString::from_vec(nodename))
-        }
-
-        #[cfg(not(any(target_os = "macos", target_os = "illumos")))]
-        {
-            let machine_info = fs::read("/etc/machine-info")?;
-
-            for i in machine_info.split(|b| *b == b'\n') {
-                let mut j = i.split(|b| *b == b'=');
-
-                if j.next() == Some(b"PRETTY_HOSTNAME") {
-                    if let Some(value) = j.next() {
-                        // FIXME: Can " be escaped in pretty name?
-                        return Ok(OsString::from_vec(value.to_vec()));
-                    }
-                }
-            }
-
-            Err(Error::new(ErrorKind::NotFound, "Missing record"))
+            // Make a new error representing the fact that both methods failed.
+            Err(Error::new(
+                ErrorKind::Other,
+                format!(
+                    "failed to obtain device name: reading from \
+                     /etc/machine-info failed with \"{}\", \
+                     and uname() failed with \"{}\"",
+                    mi_error, uname_error
+                ),
+            ))
         }
     }
 
     fn hostname(self) -> Result<String> {
-        // Maximum hostname length = 255, plus a NULL byte.
-        let mut string = Vec::<u8>::with_capacity(256);
-
-        unsafe {
-            if gethostname(string.as_mut_ptr().cast(), 255) == -1 {
-                return Err(Error::last_os_error());
-            }
-
-            string.set_len(strlen(string.as_ptr().cast()));
-        };
-
-        String::from_utf8(string).map_err(|_| {
+        gethostname()?.into_string().map_err(|_| {
             Error::new(ErrorKind::InvalidData, "Hostname not valid UTF-8")
         })
     }
@@ -604,14 +418,8 @@ impl Target for Os {
 
     #[inline(always)]
     fn arch(self) -> Result<Arch> {
-        let mut buf = UtsName::default();
-
-        if unsafe { uname(&mut buf) } == -1 {
-            return Err(Error::last_os_error());
-        }
-
-        let arch_str =
-            unsafe { CStr::from_ptr(buf.machine.as_ptr()) }.to_string_lossy();
+        let uts_name = uname()?;
+        let arch_str = uts_name.machine().to_string_lossy();
 
         Ok(match arch_str.as_ref() {
             "aarch64" | "arm64" | "aarch64_be" | "armv8b" | "armv8l" => {

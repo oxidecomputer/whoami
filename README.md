@@ -37,7 +37,7 @@ WhoAmI targets all platforms that can run Rust, including:
    - Web Browser - DOM
    - WASI (Wasite, others) **may partially or fully work - but untested**
    - Daku (Ardaku/Quantii, others) **mock implementation, full implementation planned later**
- - Illumos variants (SmartOS, OmniOS, others) **may partially or fully work - but untested**
+ - illumos variants (SmartOS, OmniOS, others) **may partially or fully work - but untested**
  - Android **may partially or fully work - but untested, planned later**
  - iOS **planned later**
  - Redox **planned later**
