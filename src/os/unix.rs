@@ -1,24 +1,24 @@
 use std::{
     env,
-    ffi::{CStr, OsString},
+    ffi::OsString,
     fs,
     io::{Error, ErrorKind},
     mem,
-    os::{
-        raw::{c_char, c_int, c_void},
-        unix::ffi::OsStringExt,
-    },
+    os::unix::ffi::OsStringExt,
 };
 #[cfg(target_os = "macos")]
 use std::{
     os::{
-        raw::{c_long, c_uchar},
+        raw::{c_long, c_uchar, c_void},
         unix::ffi::OsStrExt,
     },
     ptr::null_mut,
 };
 
-use nix::unistd::{gethostname, Uid, User};
+use nix::{
+    sys::utsname::uname,
+    unistd::{gethostname, Uid, User},
+};
 
 use crate::{
     os::{Os, Target},
@@ -216,69 +216,22 @@ pub(crate) fn lang() -> impl Iterator<Item = String> {
     }
 }
 
-#[cfg(any(
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd",
-    target_os = "illumos"
-))]
-#[repr(C)]
-struct UtsName {
-    sysname: [c_char; 256],
-    nodename: [c_char; 256],
-    release: [c_char; 256],
-    version: [c_char; 256],
-    machine: [c_char; 256],
-}
+#[cfg(not(target_os = "macos"))]
+fn read_devicename_from_machine_info() -> Result<OsString> {
+    let machine_info = fs::read("/etc/machine-info")?;
 
-#[cfg(target_os = "dragonfly")]
-#[repr(C)]
-struct UtsName {
-    sysname: [c_char; 32],
-    nodename: [c_char; 32],
-    release: [c_char; 32],
-    version: [c_char; 32],
-    machine: [c_char; 32],
-}
+    for i in machine_info.split(|b| *b == b'\n') {
+        let mut j = i.split(|b| *b == b'=');
 
-#[cfg(any(target_os = "linux", target_os = "android",))]
-#[repr(C)]
-struct UtsName {
-    sysname: [c_char; 65],
-    nodename: [c_char; 65],
-    release: [c_char; 65],
-    version: [c_char; 65],
-    machine: [c_char; 65],
-    domainname: [c_char; 65],
-}
-
-// Buffer initialization
-impl Default for UtsName {
-    fn default() -> Self {
-        unsafe { mem::zeroed() }
-    }
-}
-
-#[inline(always)]
-unsafe fn uname(buf: *mut UtsName) -> c_int {
-    extern "C" {
-        #[cfg(not(target_os = "freebsd"))]
-        fn uname(buf: *mut UtsName) -> c_int;
-
-        #[cfg(target_os = "freebsd")]
-        fn __xuname(nmln: c_int, buf: *mut c_void) -> c_int;
+        if j.next() == Some(b"PRETTY_HOSTNAME") {
+            if let Some(value) = j.next() {
+                // FIXME: Can " be escaped in pretty name?
+                return Ok(OsString::from_vec(value.to_vec()));
+            }
+        }
     }
 
-    // Polyfill `uname()` for FreeBSD
-    #[inline(always)]
-    #[cfg(target_os = "freebsd")]
-    unsafe extern "C" fn uname(buf: *mut UtsName) -> c_int {
-        __xuname(256, buf.cast())
-    }
-
-    uname(buf)
+    Err(Error::new(ErrorKind::NotFound, "Missing record"))
 }
 
 impl Target for Os {
@@ -297,6 +250,8 @@ impl Target for Os {
     fn devicename(self) -> Result<OsString> {
         #[cfg(target_os = "macos")]
         {
+            // On macOS, the computer name is fetched from the System
+            // Configuration framework.
             let out = os_from_cfstring(unsafe {
                 SCDynamicStoreCopyComputerName(null_mut(), null_mut())
             });
@@ -308,38 +263,30 @@ impl Target for Os {
             Ok(out)
         }
 
-        #[cfg(target_os = "illumos")]
+        #[cfg(not(target_os = "macos"))]
         {
-            let mut nodename = fs::read("/etc/nodename")?;
+            // On other platforms, attempt to read /etc/machine-info, and fall
+            // back to the nodename.
+            let mi_error = match read_devicename_from_machine_info() {
+                Ok(devicename) => return Ok(devicename),
+                Err(mi_error) => mi_error,
+            };
 
-            // Remove all at and after the first newline (before end of file)
-            if let Some(slice) = nodename.split(|x| *x == b'\n').next() {
-                nodename.drain(slice.len()..);
-            }
+            let uname_error = match uname() {
+                Ok(uts_name) => return Ok(uts_name.nodename().to_os_string()),
+                Err(uname_error) => uname_error,
+            };
 
-            if nodename.is_empty() {
-                return Err(Error::new(ErrorKind::InvalidData, "Empty record"));
-            }
-
-            Ok(OsString::from_vec(nodename))
-        }
-
-        #[cfg(not(any(target_os = "macos", target_os = "illumos")))]
-        {
-            let machine_info = fs::read("/etc/machine-info")?;
-
-            for i in machine_info.split(|b| *b == b'\n') {
-                let mut j = i.split(|b| *b == b'=');
-
-                if j.next() == Some(b"PRETTY_HOSTNAME") {
-                    if let Some(value) = j.next() {
-                        // FIXME: Can " be escaped in pretty name?
-                        return Ok(OsString::from_vec(value.to_vec()));
-                    }
-                }
-            }
-
-            Err(Error::new(ErrorKind::NotFound, "Missing record"))
+            // Make a new error representing the fact that both methods failed.
+            Err(Error::new(
+                ErrorKind::Other,
+                format!(
+                    "failed to obtain device name: reading from \
+                     /etc/machine-info failed with \"{}\", \
+                     and uname() failed with \"{}\"",
+                    mi_error, uname_error
+                ),
+            ))
         }
     }
 
@@ -471,14 +418,8 @@ impl Target for Os {
 
     #[inline(always)]
     fn arch(self) -> Result<Arch> {
-        let mut buf = UtsName::default();
-
-        if unsafe { uname(&mut buf) } == -1 {
-            return Err(Error::last_os_error());
-        }
-
-        let arch_str =
-            unsafe { CStr::from_ptr(buf.machine.as_ptr()) }.to_string_lossy();
+        let uts_name = uname()?;
+        let arch_str = uts_name.machine().to_string_lossy();
 
         Ok(match arch_str.as_ref() {
             "aarch64" | "arm64" | "aarch64_be" | "armv8b" | "armv8l" => {
