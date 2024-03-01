@@ -38,7 +38,7 @@ optional = true
 version = "0.1"
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.28.0", features = ["user"] }
+nix = { version = "0.28.0", features = ["hostname", "user"] }
 
 [features]
 default = ["web"]

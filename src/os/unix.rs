@@ -1,11 +1,11 @@
 use std::{
     env,
-    ffi::{c_void, CStr, OsString},
+    ffi::{CStr, OsString},
     fs,
     io::{Error, ErrorKind},
     mem,
     os::{
-        raw::{c_char, c_int},
+        raw::{c_char, c_int, c_void},
         unix::ffi::OsStringExt,
     },
 };
@@ -18,16 +18,12 @@ use std::{
     ptr::null_mut,
 };
 
-use nix::unistd::{Uid, User};
+use nix::unistd::{gethostname, Uid, User};
 
 use crate::{
     os::{Os, Target},
     Arch, DesktopEnv, Language, Platform, Result,
 };
-
-extern "system" {
-    fn gethostname(name: *mut c_void, len: usize) -> i32;
-}
 
 #[cfg(target_os = "macos")]
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -56,6 +52,7 @@ enum Name {
     Real,
 }
 
+#[cfg(target_os = "macos")]
 unsafe fn strlen(cs: *const c_void) -> usize {
     let mut len = 0;
     let mut cs: *const u8 = cs.cast();
@@ -347,18 +344,7 @@ impl Target for Os {
     }
 
     fn hostname(self) -> Result<String> {
-        // Maximum hostname length = 255, plus a NULL byte.
-        let mut string = Vec::<u8>::with_capacity(256);
-
-        unsafe {
-            if gethostname(string.as_mut_ptr().cast(), 255) == -1 {
-                return Err(Error::last_os_error());
-            }
-
-            string.set_len(strlen(string.as_ptr().cast()));
-        };
-
-        String::from_utf8(string).map_err(|_| {
+        gethostname()?.into_string().map_err(|_| {
             Error::new(ErrorKind::InvalidData, "Hostname not valid UTF-8")
         })
     }
